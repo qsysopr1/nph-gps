@@ -128,7 +128,7 @@ def main() -> None:
         params = {key: form.getfirst(key) for key in form.keys()}
 
         # Proper CGI response
-        print("Status: 200 OK")
+        print("HTTP/1.1 200 OK")
         print("Content-Type: text/plain; charset=utf-8")
         print()
 
