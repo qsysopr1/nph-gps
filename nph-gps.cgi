@@ -1,22 +1,29 @@
 #!/usr/bin/env python3.11
-"""Read gpslogger smartphone app output (CGI), log locally, and forward to HA GPSLogger integration.
+"""
+Read GPSLogger smartphone app output (CGI), log locally, and forward to HA GPSLogger integration.
 
-Key points:
-- Keep gpslogger on this host.
-- Log ALL incoming params to CSV (forensics / full fidelity).
-- Forward ONLY what HA GPSLogger webhook accepts:
-    device, latitude, longitude
-- device is derived from 'ser' (fallback to 'aid', then 'gpslogger_unknown')
-- Uses application/x-www-form-urlencoded (GPSLogger compatible)
+Known-working behavior:
+- Log incoming params to CSV
+- Forward ONLY device+latitude+longitude to HA GPSLogger webhook
 
-Options:
-- debug = 1        -> verbose debug output (includes HA response)
-- enable_ha = 0|1 -> enable/disable HA webhook forwarding
+Enhancement behavior (optional, can be disabled instantly):
+- Also forward selected optional fields that HA can use:
+  battery, accuracy, altitude, speed, direction, provider, activity
+
+Controls:
+- debug = 1                -> writes verbose debug to DEBUG_LOG_PATH
+- enable_ha = 0|1          -> enable/disable HA forwarding entirely
+- ha_send_extras = 0|1     -> 0 = known-working minimal payload (default)
+                              1 = include optional whitelisted extras
+
+Notes:
+- device is derived from 'ser' (fallback to 'aid', else 'gpslogger_unknown')
+- HA GPSLogger webhook is strict: do NOT forward arbitrary keys
 """
 
 import warnings
 warnings.filterwarnings("ignore", category=DeprecationWarning, message=".*cgi.*")
-warnings.filterwarnings("ignore", category=DeprecationWarning, message=".*cgitb.*")
+warnings.filterwarnings("ignore", category=DeprecationWarning, message=".*cgi.*")
 
 import os
 import cgi
@@ -28,84 +35,61 @@ import urllib.request
 import urllib.error
 import urllib.parse
 
-# Enable CGI traceback (hidden from clients)
 cgitb.enable(display=0, logdir=None)
 
-# ------------------------------ Options ------------------------------
-debug = 0        # 1 = verbose debug output
-enable_ha = 1    # 1 = forward to Home Assistant webhook
+# ------------------------------ Flags ------------------------------
+debug = 1
+enable_ha = 1
 
-# ------------------------------ Configuration ------------------------------
+# QUICK TOGGLE:
+# 0 = known-working minimal HA payload (device,latitude,longitude)
+# 1 = include optional HA fields (battery,accuracy,altitude,speed,direction,provider,activity)
+ha_send_extras = 1
+
+# ------------------------------ Paths / URLs ------------------------------
 CSV_FILE_PATH = "/var/www/stat/mailtmp/obd/gps.csv"
+DEBUG_LOG_PATH = "/var/www/stat/mailtmp/obd/gps.debug.log"
+
 HA_WEBHOOK_URL = (
     "https://ha.example.com:8123/api/webhook/"
-    "a3c04d4fd177100b896f8417ca8bf72d4c03345daafab6ff0aea6afd2d5c41bf"
+    "a3c04d4ed17f100b896e8417ca8ba72f4c03345daabab6ff0fea6acd2d5c41be"
 )
 HA_TIMEOUT_SECONDS = 5
 
 
-def log_debug(msg: str) -> None:
-    """Emit debug output only when debug=1."""
-    if debug == 1:
-        warnings.warn(msg)
-
-
-def send_to_home_assistant_form(payload: dict) -> bool:
-    """POST form-encoded payload to HA GPSLogger webhook."""
-    if enable_ha != 1:
-        log_debug("HA webhook disabled (enable_ha=0)")
-        return False
-
+def dlog(msg: str) -> None:
+    """Write debug to a file when debug=1 (does not depend on Apache log routing)."""
+    if debug != 1:
+        return
     try:
-        encoded = urllib.parse.urlencode(payload, doseq=False).encode("utf-8")
-
-        req = urllib.request.Request(
-            HA_WEBHOOK_URL,
-            data=encoded,
-            headers={
-                "Content-Type": "application/x-www-form-urlencoded; charset=utf-8",
-                "User-Agent": "gpslogger-intake/1.0",
-                "Content-Length": str(len(encoded)),
-            },
-            method="POST",
-        )
-
-        log_debug(f"HA POST URL: {HA_WEBHOOK_URL}")
-        log_debug(f"HA POST payload: {payload}")
-        log_debug(f"HA POST body: {encoded!r}")
-
-        with urllib.request.urlopen(req, timeout=HA_TIMEOUT_SECONDS) as resp:
-            status = getattr(resp, "status", None) or resp.getcode()
-            body = resp.read().decode("utf-8", errors="replace")
-
-            log_debug(f"HA response status: {status}")
-            log_debug(f"HA response headers: {dict(resp.headers)}")
-            log_debug(f"HA response body: {body}")
-
-            return 200 <= int(status) < 300
-
-    except urllib.error.HTTPError as e:
+        ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        with open(DEBUG_LOG_PATH, "a") as f:
+            f.write(f"{ts} {msg}\n")
+    except Exception:
+        # last resort
         try:
-            err_body = e.read().decode("utf-8", errors="replace")
+            sys.stderr.write(msg + "\n")
         except Exception:
-            err_body = "<unreadable>"
+            pass
 
-        log_debug(f"HA HTTPError status: {e.code}")
-        log_debug(f"HA HTTPError headers: {dict(e.headers)}")
-        log_debug(f"HA HTTPError body: {err_body}")
-        return False
 
-    except urllib.error.URLError as e:
-        log_debug(f"HA URLError: {e.reason}")
-        return False
-
-    except Exception as e:
-        log_debug(f"HA unexpected exception: {e}")
-        return False
+def parse_params(form: cgi.FieldStorage) -> dict:
+    """
+    Safely build params from FieldStorage.list.
+    Avoids edge cases where form.keys() can yield non-hashable objects.
+    """
+    params = {}
+    items = getattr(form, "list", None) or []
+    for item in items:
+        name = getattr(item, "name", None)
+        if not isinstance(name, str) or not name:
+            continue
+        params[name] = getattr(item, "value", "")
+    return params
 
 
 def write_csv_row(params: dict, remote_addr: str) -> None:
-    """Write a stable, human-readable CSV row (does not affect HA forwarding)."""
+    """Stable CSV summary (full fidelity still in debug log if enabled)."""
     row = [
         datetime.datetime.now().strftime("%H:%M:%S %m/%d/%y"),
         params.get("timestamp", ""),
@@ -120,59 +104,124 @@ def write_csv_row(params: dict, remote_addr: str) -> None:
         csv.writer(f).writerow(row)
 
 
-def main() -> None:
+def build_ha_payload(params: dict) -> dict:
+    """Build HA payload. Minimal by default; optional extras behind ha_send_extras."""
+    device = (params.get("ser") or "").strip() or (params.get("aid") or "").strip() or "gpslogger_unknown"
+    lat = (params.get("lat") or "").strip()
+    lon = (params.get("lon") or "").strip()
+
+    payload = {
+        "device": device,
+        "latitude": lat,
+        "longitude": lon,
+    }
+
+    if ha_send_extras != 1:
+        return payload
+
+    # Optional whitelisted extras (send ONLY if present and non-empty)
+    # GPSLogger -> HA key mapping:
+    # batt -> battery
+    # acc  -> accuracy
+    # alt  -> altitude
+    # spd  -> speed
+    # dir  -> direction
+    # prov -> provider
+    # act  -> activity
+    mapping = {
+        "batt": "battery",
+        "acc": "accuracy",
+        "alt": "altitude",
+        "spd": "speed",
+        "dir": "direction",
+        "prov": "provider",
+        "act": "activity",
+    }
+
+    for src, dst in mapping.items():
+        v = (params.get(src) or "").strip()
+        if v != "":
+            payload[dst] = v
+
+    return payload
+
+
+def send_to_home_assistant_form(payload: dict) -> tuple[bool, str]:
+    """POST form-encoded payload to HA GPSLogger webhook and return (ok, info)."""
+    if enable_ha != 1:
+        return False, "ha_disabled"
+
+    encoded = urllib.parse.urlencode(payload, doseq=False).encode("utf-8")
+    req = urllib.request.Request(
+        HA_WEBHOOK_URL,
+        data=encoded,
+        headers={
+            "Content-Type": "application/x-www-form-urlencoded; charset=utf-8",
+            "User-Agent": "gpslogger-intake/1.0",
+            "Content-Length": str(len(encoded)),
+        },
+        method="POST",
+    )
+
     try:
+        with urllib.request.urlopen(req, timeout=HA_TIMEOUT_SECONDS) as resp:
+            status = resp.getcode()
+            body = resp.read().decode("utf-8", errors="replace")
+            return 200 <= int(status) < 300, f"{status} {body}".strip()
+    except urllib.error.HTTPError as e:
+        body = e.read().decode("utf-8", errors="replace")
+        return False, f"{e.code} {body}".strip()
+    except Exception as e:
+        return False, f"exc {e}"
+
+
+def main() -> None:
+    # Always return 200 so GPSLogger doesn’t stop sending while you debug.
+    print("HTTP/1.1 200 OK")
+    print("Content-Type: text/plain")
+    print("Connection: close")
+    print()
+    print("OK")
+
+    remote_addr = (os.environ.get("REMOTE_ADDR") or "").strip()
+
+    try:
+        dlog(f"HIT remote_addr={remote_addr} qs={os.environ.get('QUERY_STRING','')!r}")
+
         form = cgi.FieldStorage()
+        params = parse_params(form)
 
-        # Preserve gpslogger semantics: single-value keys
-        params = {key: form.getfirst(key) for key in form.keys()}
+        dlog(f"PARAMS keys={sorted(params.keys())}")
 
-        # Proper CGI response
-        print("HTTP/1.1 200 OK")
-        print("Content-Type: text/plain; charset=utf-8")
-        print()
-
-        # gpslogger always has timestamp; if not, ignore silently
-        if "timestamp" not in params or not params.get("timestamp"):
-            log_debug("Missing or empty timestamp; ignoring request")
+        # Require timestamp to treat as valid GPSLogger telemetry
+        ts = (params.get("timestamp") or "").strip()
+        if not ts:
+            dlog("DROP missing timestamp")
             return
 
-        remote_addr = (os.environ.get("REMOTE_ADDR") or "").strip()
-        log_debug(f"REMOTE_ADDR: {remote_addr}")
-        log_debug(f"Incoming gpslogger params: {params}")
-
-        # 1) Local CSV logging (full fidelity is preserved elsewhere; CSV is stable summary)
+        # Local CSV write first (HA failures won't prevent logging)
         write_csv_row(params, remote_addr)
+        dlog("CSV wrote row")
 
-        # 2) HA GPSLogger integration is STRICT: only send accepted keys
-        device = (params.get("ser") or "").strip()
-        if not device:
-            device = (params.get("aid") or "").strip()
-        if not device:
-            device = "gpslogger_unknown"
+        # Build HA payload (minimal or enriched based on ha_send_extras)
+        ha_payload = build_ha_payload(params)
 
-        lat = (params.get("lat") or "").strip()
-        lon = (params.get("lon") or "").strip()
-
-        # If GPSLogger didn't send lat/lon, don't bother HA
-        if not lat or not lon:
-            log_debug("Missing lat/lon; skipping HA forward")
+        # Require coordinates before forwarding
+        if not ha_payload.get("latitude") or not ha_payload.get("longitude"):
+            dlog("SKIP HA missing lat/lon")
             return
 
-        ha_payload = {
-            "device": device,
-            "latitude": lat,
-            "longitude": lon,
-        }
+        # Show exactly what sending to HA
+        dlog(f"HA payload minimal={ha_send_extras == 0} keys={sorted(ha_payload.keys())} device={ha_payload.get('device')}")
 
-        ha_ok = send_to_home_assistant_form(ha_payload)
+        ok, info = send_to_home_assistant_form(ha_payload)
+        dlog(f"HA ok={ok} info={info}")
 
         if debug == 1:
-            print(f"logged=1 ha_enabled={enable_ha} ha_forwarded={1 if ha_ok else 0}")
+            dlog(f"logged=1 ha_enabled={enable_ha} extras={ha_send_extras} ha_forwarded={1 if ok else 0}")
 
     except Exception as e:
-        log_debug(f"Fatal intake exception: {e}")
-        sys.exit(0)
+        dlog(f"FATAL {e}")
 
 
 if __name__ == "__main__":
